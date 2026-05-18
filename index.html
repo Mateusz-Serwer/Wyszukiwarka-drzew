@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lokalizator Działek po GPS i Kliknięciu</title>
+    
+    <!-- Biblioteka Leaflet (CSS i JS) -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f4f4f9;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        .control-box {
+            margin-bottom: 20px;
+            padding: 15px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        #map {
+            height: 500px;
+            width: 100%;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        #status {
+            margin-top: 5px;
+            font-size: 15px;
+            color: #333;
+            line-height: 1.4;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>Identyfikacja Działki: GPS + Kliknięcie</h2>
+    
+    <div class="control-box">
+        <div id="status">Inicjalizacja aplikacji... Zaakceptuj uprawnienia do GPS, jeśli wyskoczy okienko.</div>
+    </div>
+
+    <div id="map"></div>
+</div>
+
+<script>
+    // 1. Inicjalizacja mapy (środek Polski)
+    const map = L.map('map').setView([52.069167, 19.480556], 6);
+
+    // 2. Warstwa bazowa OpenStreetMap
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '© OpenStreetMap contributors'
+    }).addTo(map);
+
+    // 3. Warstwa WMS z Geoportalu (Krajowa Integracja Ewidencji Działek)
+    L.tileLayer.wms("https://integracja.gugik.gov.pl/cgi-bin/KrajowaIntegracjaEwidencjiDzialek", {
+        layers: 'dzialki,numery_dzialek',
+        format: 'image/png',
+        transparent: true,
+        version: '1.1.1',
+        attribution: "GUGiK (Geoportal)"
+    }).addTo(map);
+
+    let currentMarker = null;
+    let isFirstLoad = true; // Flaga dla GPS, żeby przybliżyć tylko raz
+
+    // --- AUTOMATYCZNE URUCHOMIENIE GPS WRAZ Z ŁADOWANIEM STRONY ---
+    window.onload = function() {
+        startTracking();
+    };
+
+    // 4. Obsługa kliknięcia na mapie
+    map.on('click', function(e) {
+        const lat = e.latlng.lat;
+        const lng = e.latlng.lng;
+        
+        document.getElementById('status').innerHTML = `Sprawdzanie klikniętego punktu: ${lat.toFixed(5)}, ${lng.toFixed(5)}...`;
+        
+        // Kliknięcie wymusza wyśrodkowanie mapy na wybranym miejscu
+        getParcelByCoordinates(lat, lng, true);
+    });
+
+    // 5. Funkcja ciągłego śledzenia GPS
+    function startTracking() {
+        const status = document.getElementById('status');
+        
+        if (!navigator.geolocation) {
+            status.innerHTML = "<span style='color:red;'>Geolokalizacja nie jest wspierana przez Twoją przeglądarkę. Możesz klikać na mapie.</span>";
+            return;
+        }
+
+        status.innerText = "Uruchamianie GPS... Jeśli to konieczne, zezwól na dostęp w przeglądarce.";
+
+        navigator.geolocation.watchPosition(
+            (position) => {
+                const lat = position.coords.latitude;
+                const lng = position.coords.longitude;
+                const accuracy = position.coords.accuracy;
+                
+                status.innerHTML = `📡 <b>Sygnał GPS aktywny</b> (Dokładność: do ${Math.round(accuracy)}m)<br>Szukam działki dla Twojej pozycji...`;
+                
+                // Dla GPS: centrujemy mapę tylko przy pierwszym wykryciu sygnału
+                getParcelByCoordinates(lat, lng, isFirstLoad);
+                isFirstLoad = false; 
+            },
+            (error) => {
+                console.warn("GPS wyłączony lub zablokowany:", error.message);
+                status.innerHTML = "ℹ️ <b>Tryb ręczny (brak HTTPS lub GPS wyłączony):</b> <br><b>Kliknij w dowolnym miejscu na mapie</b>, aby zobaczyć numer działki.";
+            },
+            { 
+                enableHighAccuracy: true, 
+                timeout: 10000, 
+                maximumAge: 0 
+            }
+        );
+    }
+
+    // 6. Główna funkcja odpytująca API Geoportalu przez PROXY CORS
+    async function getParcelByCoordinates(lat, lng, shouldCenterMap = false) {
+        const status = document.getElementById('status');
+        
+        if (currentMarker) {
+            map.removeLayer(currentMarker);
+        }
+
+        const fixedLat = lat.toFixed(6);
+        const fixedLng = lng.toFixed(6);
+
+        // Zapytanie do API ULDK
+        const uldkApiUrl = `https://uldk.gugik.gov.pl/gugik.php?req=GetParcelByXY&xy=${fixedLng},${fixedLat}&srid=4326&result=id,parcel,commune`;
+        
+        // Ominięcie błędu 'Failed to fetch' przy użyciu publicznego proxy corsproxy.io
+        const proxyUrl = 'https://corsproxy.io/?' + encodeURIComponent(uldkApiUrl);
+
+        try {
+            const response = await fetch(proxyUrl);
+            if (!response.ok) throw new Error("Problem z bramką CORS lub serwerem Geoportalu");
+            
+            const text = await response.text();
+            const lines = text.trim().split('\n');
+            
+            if (lines[0].trim() === "0" && lines[1]) {
+                const data = lines[1].split('|');
+                const parcelId = data[0];      
+                const parcelNumber = data[1];  
+
+                if (shouldCenterMap) {
+                    map.setView([lat, lng], 18);
+                }
+
+                currentMarker = L.marker([lat, lng]).addTo(map)
+                    .bindPopup(`<b>Działka nr: ${parcelNumber}</b><br>ID: ${parcelId}`)
+                    .openPopup();
+
+                status.innerHTML = `📍 <b>Znaleziono działkę!</b><br>
+                                    <b>Numer działki:</b> <span style="color:#007bff; font-size:16px;">${parcelNumber}</span><br>
+                                    <b>Pełny identyfikator:</b> <code style='background:#eee; padding:2px 5px;'>${parcelId}</code>`;
+            } else {
+                currentMarker = L.marker([lat, lng]).addTo(map)
+                    .bindPopup("Brak danych o działce")
+                    .openPopup();
+                    
+                status.innerHTML = `📍 Współrzędne: ${fixedLat}, ${fixedLng}<br><span style='color:orange;'>Geoportal nie zwrócił działki dla tego punktu.</span>`;
+            }
+        } catch (error) {
+            console.error("Błąd API ULDK:", error);
+            status.innerHTML = `<span style='color:red;'>⚠️ <b>Błąd komunikacji:</b> ${error.message}</span>`;
+        }
+    }
+</script>
+
+</body>
+</html>
